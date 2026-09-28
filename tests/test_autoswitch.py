@@ -1940,6 +1940,12 @@ class TestKeyFallback:
         assert self._settings() == {"apiKeyHelper": "/usr/local/bin/other-helper"}
         assert self._fallback_events(h) == []
 
+    def test_an_unreadable_subscription_does_not_hold_it_back(self, temp_home):
+        # A dead login reads as unknown; the engine never switches to it.
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(100), None))
+        assert "apiKeyHelper" in self._settings()
+
     def test_needs_an_api_key_account(self, temp_home):
         h = self._harness(temp_home, with_key=False)
         h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))

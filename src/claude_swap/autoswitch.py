@@ -962,8 +962,10 @@ class AutoSwitchEngine:
             if num == current or self.switcher.account_kind_for(num) == "api_key":
                 continue
             h = headroom.get(num)
-            if h is None or (100.0 - h) < settings.threshold:
-                return  # somewhere to switch (or unknown): not spent yet
+            # Unreadable accounts (dead refresh token, fetch failures) are
+            # never switch targets, so they cannot hold the fallback back.
+            if h is not None and (100.0 - h) < settings.threshold:
+                return  # somewhere to switch: the engine moves there instead
         if key_fallback.set_enabled(True):
             detail = (
                 f"account {current} at {pct_label(utilization)}% and every other "
