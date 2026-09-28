@@ -33,7 +33,7 @@ from claude_swap.autoswitch import (
 from claude_swap.json_output import USAGE_FOREIGN_CREDENTIAL, USAGE_TOKEN_EXPIRED
 from claude_swap.usage_store import FetchRecord, UsageEntry
 from claude_swap.models import Platform
-from claude_swap.settings import AutoSwitchSettings
+from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 from claude_swap.switcher import ClaudeAccountSwitcher
 
 
@@ -1757,6 +1757,87 @@ class TestApiKeyAccounts:
             "active-api-key"
         ]
 
+    # -- active API key WITH includeApiKeyAccounts: hold, then return to a plan --
+
+    def _key_active(self, temp_home, **kw):
+        h = EngineHarness(temp_home, include_api_key_accounts=True, **kw)
+        h.seed(1, "key@token.local")
+        h.seed(2, "b@example.com")
+        h.seed(3, "c@example.com")
+        h.make_live("key@token.local", 1)
+        self._mark_api_key(h, 1)
+        return h
+
+    def test_active_api_key_holds_while_no_plan_is_below_the_margin(self, temp_home):
+        # threshold 90, hysteresis 10: a plan must be at or below 80% to land.
+        h = self._key_active(temp_home)
+        for _ in range(6):  # far past unhealthy_ticks (3): never a failover
+            outcome = h.tick_with_usage({
+                "1": "api key", "2": _usage(95), "3": _usage(85),
+            })
+            assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+        assert h.engine._unhealthy_ticks == 0
+        reasons = {e.reason for e in h.events if isinstance(e, NoSwitchEvent)}
+        assert reasons == {"api-key-hold"}
+
+    def test_active_api_key_returns_to_the_recovered_plan(self, temp_home):
+        h = self._key_active(temp_home)
+        outcome = h.tick_with_usage({
+            "1": "api key", "2": _usage(95), "3": _usage(30),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+        sw = next(e for e in h.events if isinstance(e, SwitchEvent))
+        assert sw.trigger == "plan-recovered"
+
+    def test_active_api_key_return_ignores_cooldown_and_no_return_bar(self, temp_home):
+        h = self._key_active(temp_home)
+        # We arrived on the key from #3 one second ago (at-limit); #3 has
+        # since rolled over. Neither the cooldown nor the no-return bar may
+        # keep us paying for API tokens.
+        atomic_write_json(h.engine.state_path, {
+            "schemaVersion": 1,
+            "lastSwitchAt": h.clock() - 1,
+            "lastSwitchTo": "1",
+            "lastSwitchFrom": 3,
+            "leftHeadroom": 0.0,
+            "leftRecoveryAt": None,
+            "leftTrigger": "at-limit",
+        })
+        outcome = h.tick_with_usage({
+            "1": "api key", "2": _usage(95), "3": _usage(5),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_active_api_key_return_prefers_most_headroom_under_best(self, temp_home):
+        h = self._key_active(temp_home)
+        outcome = h.tick_with_usage({
+            "1": "api key", "2": _usage(70), "3": _usage(20),
+        })
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_active_api_key_return_prefers_soonest_reset_under_consume_first(
+        self, temp_home
+    ):
+        h = self._key_active(temp_home, strategy="consume-first")
+        later = {"five_hour": {"pct": 20.0}, "seven_day": {"pct": 60.0, "resets_at": "2026-01-08T00:00:00Z"}}
+        sooner = {"five_hour": {"pct": 40.0}, "seven_day": {"pct": 70.0, "resets_at": "2026-01-02T00:00:00Z"}}
+        outcome = h.tick_with_usage({"1": "api key", "2": later, "3": sooner})
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 3
+
+    def test_active_api_key_never_targets_another_api_key(self, temp_home):
+        h = self._key_active(temp_home)
+        self._mark_api_key(h, 2)
+        outcome = h.tick_with_usage({
+            "1": "api key", "2": "api key", "3": _usage(95),
+        })
+        assert outcome is TickOutcome.NO_ACTION
+        assert h.active_number() == 1
+
 
 class TestFreshening:
     def test_near_expiry_target_is_refreshed_and_persisted(self, temp_home):
@@ -3207,7 +3288,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
 
     def test_the_null_snapshot_answers_differently_by_recorded_trigger(self):
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3256,7 +3337,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         existed has no such key. Must fall back to the old two-null
         inference (failover) rather than crash or silently misclassify."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -3292,7 +3373,7 @@ class TestConsumeFirstDepartureRecordsItsOwnTrigger:
         more permissive failover landing floor, regardless of whether some
         future change makes the failover branch unconditional."""
         from claude_swap.autoswitch import AutoSwitchEngine
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 
         class Fake(AutoSwitchEngine):
             def __init__(self):
@@ -4626,7 +4707,7 @@ class TestHorizonAxisDoesNotFlap:
         combinations, every one identical. The ranking is the only place the
         bar's effect is observable in isolation.
         """
-        from claude_swap.settings import AutoSwitchSettings
+        from claude_swap.settings import AutoSwitchSettings, atomic_write_json
 
         args = dict(
             trigger="proactive",

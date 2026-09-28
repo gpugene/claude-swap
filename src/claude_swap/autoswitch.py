@@ -362,7 +362,7 @@ class PollEvent(AutoSwitchEvent):
 @dataclass(frozen=True)
 class SwitchEvent(AutoSwitchEvent):
     kind: ClassVar[str] = "switch"
-    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first"
+    trigger: str  # "proactive" | "at-limit" | "failover" | "consume-first" | "plan-recovered"
     from_ref: dict | None
     to_ref: dict | None
     warnings: list[str] = field(default_factory=list)
@@ -960,17 +960,29 @@ class AutoSwitchEngine:
         if not self._model_check_done:
             self._check_model_names(quarantined, usage)
 
-        if (
-            self.switcher.account_kind_for(current) == "api_key"
-            and not settings.include_api_key_accounts
-        ):
-            self._emit(
-                NoSwitchEvent(
-                    reason="active-api-key",
-                    detail="API-key accounts have no quota to watch",
+        if self.switcher.account_kind_for(current) == "api_key":
+            if not settings.include_api_key_accounts:
+                self._emit(
+                    NoSwitchEvent(
+                        reason="active-api-key",
+                        detail="API-key accounts have no quota to watch",
+                    )
                 )
-            )
-            return TickOutcome.NO_ACTION
+                return TickOutcome.NO_ACTION
+            # A metered API key is the last resort, never a home. Its usage is
+            # the USAGE_API_KEY sentinel (headroom None), which the generic
+            # path below counts as *unhealthy* and, after ``unhealthy_ticks``,
+            # "fails over" to ANY OAuth account with more than 0% headroom --
+            # including one at 99% that hits its limit a minute later and
+            # bounces straight back to the key. Measured 2026-09-28: 6->4 (4
+            # at 99%), 4->6, 6->1, 1->2, 2->6, 6->3, 3->6 inside 26 minutes.
+            # Instead: hold on the key, keep polling every subscription
+            # account, and leave the moment one has recovered enough to be a
+            # real landing spot (below the threshold by the hysteresis margin,
+            # so it cannot re-trigger next tick). No cooldown and no no-return
+            # bar: going back to a plan is the whole point, and the margin is
+            # the anti-flap.
+            return self._return_from_api_key(current, quarantined, usage, headroom)
 
         active_headroom = headroom.get(current)
         if active_headroom is not None:
@@ -1374,6 +1386,76 @@ class AutoSwitchEngine:
                     message="could not freshen: " + _SYSTEMIC_MESSAGES[systemic]
                     if systemic
                     else "could not freshen any candidate (network?)",
+                    transient=True,
+                )
+            )
+            return TickOutcome.ERROR
+        self._emit(NoSwitchEvent(reason="no-viable-target"))
+        return TickOutcome.BLOCKED
+
+    def _return_from_api_key(
+        self,
+        current: str,
+        quarantined: set[str],
+        usage: dict[str, dict | str | None],
+        headroom: dict[str, float | None],
+    ) -> TickOutcome:
+        """Leave the active API key as soon as a subscription account can take
+        the load; otherwise hold (never fail over, never count unhealthy)."""
+        settings = self.settings
+        self._unhealthy_ticks = 0
+        self._idle_hold_since = None
+        floor = settings.threshold - settings.hysteresis_pct
+        now = self.clock()
+        eligible: list[tuple[tuple, str]] = []
+        for num in self.switcher.switchable_account_numbers():
+            if num == current or num in quarantined:
+                continue
+            if self.switcher.account_kind_for(num) == "api_key":
+                continue
+            h = headroom.get(num)
+            if h is None or (100.0 - h) > floor:
+                continue
+            if settings.strategy == "consume-first":
+                reset_ts = _seven_day_reset_ts(usage.get(num), now)
+                key: tuple = (reset_ts if reset_ts is not None else float("inf"), -h)
+            else:
+                key = (-h,)
+            eligible.append((key, num))
+        if not eligible:
+            self._emit(
+                NoSwitchEvent(
+                    reason="api-key-hold",
+                    detail=(
+                        "no subscription account is below "
+                        f"{pct_label(floor)}% utilization yet"
+                    ),
+                )
+            )
+            return TickOutcome.NO_ACTION
+        eligible.sort(key=lambda t: t[0])
+        transient_failure = False
+        for _, num in eligible:
+            email = self.switcher.account_email(num)
+            if self.dry_run:
+                return self._perform(num, email, "plan-recovered", (None, float("inf")))
+            status = self._freshen_target(num, email)
+            if status == "identity-conflict":
+                self._quarantine(num, email, "identity-conflict")
+                continue
+            if status == "invalid_grant":
+                self._quarantine(num, email, "invalid_grant")
+                continue
+            if status in ("transient", *_SYSTEMIC_STATUSES):
+                transient_failure = True
+                continue
+            if status == "skip-live-session":
+                continue
+            return self._perform(num, email, "plan-recovered", (None, float("inf")))
+        if transient_failure:
+            self._emit(
+                ErrorEvent(
+                    message="could not freshen any recovered subscription account",
                     transient=True,
                 )
             )
