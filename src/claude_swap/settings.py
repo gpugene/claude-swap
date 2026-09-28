@@ -50,6 +50,15 @@ class AutoSwitchSettings:
     strategy: str = "best"  # "best" (most headroom) or "consume-first" (soonest weekly reset)
     include_api_key_accounts: bool = False
     unhealthy_ticks: int = 3
+    # Route every running Claude Code session onto the first API-key account
+    # (via Claude Code's ``apiKeyHelper`` setting) once the active
+    # subscription account reaches ``key_fallback_threshold`` and no other
+    # subscription account is below ``threshold``; remove it again as soon as
+    # the active account is back below ``threshold``. See key_fallback.py for
+    # why this, and not a live-login switch, is the only fallback running
+    # sessions follow.
+    key_fallback: bool = False
+    key_fallback_threshold: float = 95.0
     # Comma-separated model display name(s) (e.g. "Fable" or "Fable,Opus"),
     # or "all" for every scoped window an account reports. Each named model's
     # per-model weekly limit is folded into the binding window, so the engine
@@ -130,6 +139,14 @@ SETTING_SPECS: dict[str, SettingSpec] = {
         SettingSpec(
             "autoswitch", "unhealthyTicks", "unhealthy_ticks", "int", 1, 100,
             help="Consecutive failed polls before an account is unhealthy",
+        ),
+        SettingSpec(
+            "autoswitch", "keyFallback", "key_fallback", "bool",
+            help="When every subscription is spent, point Claude Code's apiKeyHelper at the API-key account",
+        ),
+        SettingSpec(
+            "autoswitch", "keyFallbackThreshold", "key_fallback_threshold", "float", 50.0, 100.0,
+            help="Active-account pct at which the API-key fallback engages",
         ),
         SettingSpec(
             "autoswitch", "model", "model", "string",

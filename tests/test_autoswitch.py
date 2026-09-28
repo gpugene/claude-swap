@@ -21,6 +21,7 @@ from claude_swap.autoswitch import (
     AutoSwitchEngine,
     ConfigWarningEvent,
     ErrorEvent,
+    KeyFallbackEvent,
     NoSwitchEvent,
     PollEvent,
     QuarantineEvent,
@@ -1837,6 +1838,132 @@ class TestApiKeyAccounts:
         })
         assert outcome is TickOutcome.NO_ACTION
         assert h.active_number() == 1
+
+
+
+class TestKeyFallback:
+    """``apiKeyHelper`` fallback: on once every subscription is spent, off as
+    soon as the live one has room, and a foreign helper is never touched."""
+
+    def _harness(self, temp_home, *, with_key=True, **kw):
+        kw.setdefault("key_fallback", True)
+        h = EngineHarness(temp_home, **kw)
+        h.seed(1, "a@example.com")
+        h.seed(2, "b@example.com")
+        if with_key:
+            h.seed(3, "key@token.local")
+        h.make_live("a@example.com", 1)
+        if with_key:
+            data = h.switcher._get_sequence_data()
+            data["accounts"]["3"]["kind"] = "api_key"
+            h.switcher._write_json(h.switcher.sequence_file, data)
+        self.settings_file = temp_home / ".claude" / "settings.json"
+        self._write({"model": "opus", "permissions": {"allow": ["Bash"]}})
+        return h
+
+    def _write(self, data):
+        self.settings_file.write_text(json.dumps(data, indent=2) + "\n")
+
+    def _settings(self):
+        return json.loads(self.settings_file.read_text())
+
+    def _usage(self, h, one, two):
+        usage = {"1": one, "2": two}
+        if "3" in h.switcher.switchable_account_numbers():
+            usage["3"] = "api key"
+        return usage
+
+    def _fallback_events(self, h):
+        return [e for e in h.events if isinstance(e, KeyFallbackEvent)]
+
+    def test_engages_when_every_subscription_is_spent(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(97), _usage(99)))
+        s = self._settings()
+        assert s["apiKeyHelper"].endswith("cswap key-helper")
+        assert s["model"] == "opus" and s["permissions"] == {"allow": ["Bash"]}
+        assert [e.on for e in self._fallback_events(h)] == [True]
+        assert h.active_number() == 1  # the live login stays on the plan
+
+    def test_waits_for_its_own_threshold(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(93), _usage(92)))
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_switches_instead_while_another_subscription_has_room(self, temp_home):
+        h = self._harness(temp_home)
+        outcome = h.tick_with_usage(self._usage(h, _usage(96), _usage(30)))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_disengages_when_the_live_subscription_rolls_over(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert "apiKeyHelper" in self._settings()
+        h.clock.advance(3600)
+        h.tick_with_usage(self._usage(h, _usage(5), _usage(100)))
+        s = self._settings()
+        assert "apiKeyHelper" not in s
+        assert s == {"model": "opus", "permissions": {"allow": ["Bash"]}}
+        assert [e.on for e in self._fallback_events(h)] == [True, False]
+
+    def test_disengages_after_switching_to_a_recovered_account(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert "apiKeyHelper" in self._settings()
+        h.clock.advance(3600)
+        outcome = h.tick_with_usage(self._usage(h, _usage(100), _usage(10)))
+        assert outcome is TickOutcome.SWITCHED
+        assert h.active_number() == 2
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_holds_between_the_two_thresholds(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(97), _usage(95)))
+        assert "apiKeyHelper" in self._settings()
+        h.clock.advance(120)
+        h.tick_with_usage(self._usage(h, _usage(92), _usage(95)))
+        assert "apiKeyHelper" in self._settings()
+
+    def test_unknown_active_usage_holds(self, temp_home):
+        h = self._harness(temp_home)
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        h.clock.advance(120)
+        h.tick_with_usage(self._usage(h, None, _usage(100)))
+        assert "apiKeyHelper" in self._settings()
+
+    def test_never_touches_a_foreign_helper(self, temp_home):
+        h = self._harness(temp_home)
+        self._write({"apiKeyHelper": "/usr/local/bin/other-helper"})
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert self._settings() == {"apiKeyHelper": "/usr/local/bin/other-helper"}
+        assert self._fallback_events(h) == []
+
+    def test_needs_an_api_key_account(self, temp_home):
+        h = self._harness(temp_home, with_key=False)
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_disabling_the_feature_removes_our_helper(self, temp_home):
+        h = self._harness(temp_home, key_fallback=False)
+        self._write({"model": "opus", "apiKeyHelper": "/x/bin/cswap key-helper"})
+        h.tick_with_usage(self._usage(h, _usage(10), _usage(10)))
+        assert self._settings() == {"model": "opus"}
+
+    def test_dry_run_never_writes(self, temp_home):
+        h = self._harness(temp_home)
+        h.engine = h._make_engine(dry_run=True)
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_settings_are_rewritten_in_place(self, temp_home):
+        # Claude Code watches the file; a rename would swap the inode away.
+        h = self._harness(temp_home)
+        inode = self.settings_file.stat().st_ino
+        h.tick_with_usage(self._usage(h, _usage(100), _usage(100)))
+        assert "apiKeyHelper" in self._settings()
+        assert self.settings_file.stat().st_ino == inode
 
 
 class TestFreshening:

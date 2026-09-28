@@ -51,6 +51,7 @@ from claude_swap.poll_policy import (
     RESET_SLACK_S,
     binding_pct,
 )
+from claude_swap import key_fallback
 from claude_swap.settings import AutoSwitchSettings, atomic_write_json, parse_model_names
 from claude_swap.switcher import ClaudeAccountSwitcher
 from claude_swap.usage_store import due_candidate, plan_oversleeps_interval
@@ -388,6 +389,22 @@ class SwitchEvent(AutoSwitchEvent):
         )
         prefix = "[dry-run] would switch" if self.dry_run else "Switched"
         return f"{prefix} {src} -> {dst} ({self.trigger})"
+
+
+@dataclass(frozen=True)
+class KeyFallbackEvent(AutoSwitchEvent):
+    """The API-key fallback (Claude Code ``apiKeyHelper``) was turned on/off."""
+
+    kind: ClassVar[str] = "key-fallback"
+    on: bool
+    detail: str = ""
+
+    def _fields(self) -> dict:
+        return {"on": self.on, "detail": self.detail}
+
+    def human(self) -> str:
+        state = "ON (sessions bill the API key)" if self.on else "OFF (back on the subscription)"
+        return f"API-key fallback {state}" + (f": {self.detail}" if self.detail else "")
 
 
 @dataclass(frozen=True)
@@ -879,15 +896,81 @@ class AutoSwitchEngine:
     def tick(self) -> TickOutcome:
         """Evaluate once: poll usage, maybe switch. Never raises."""
         try:
-            return self._tick_inner()
+            outcome = self._tick_inner()
         except ClaudeSwitchError as e:
             self._emit(ErrorEvent(message=str(e), transient=True))
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
         except Exception as e:  # pragma: no cover - safety net
             self._emit(
                 ErrorEvent(message=f"{type(e).__name__}: {e}", transient=True)
             )
-            return TickOutcome.ERROR
+            outcome = TickOutcome.ERROR
+        if not self.dry_run:
+            try:
+                self._sync_key_fallback()
+            except Exception as e:  # pragma: no cover - never break the loop
+                _logger.warning("key fallback sync failed: %s", e)
+        return outcome
+
+    def _sync_key_fallback(self) -> None:
+        """Turn Claude Code's ``apiKeyHelper`` on when every subscription is
+        spent, and off as soon as the live subscription has room again.
+
+        Runs after every tick on the store's current readings (no fetches of
+        its own). ON needs all of: the feature enabled, a managed OAuth login
+        live, its utilization at or above ``key_fallback_threshold``, no other
+        subscription account below ``threshold`` (if one exists the engine
+        switches to it instead), and an API-key account to bill. OFF when the
+        live subscription is below ``threshold`` again (a window rolled over,
+        or the engine switched to a recovered account), or the feature is
+        disabled. Anything unknown holds the current state.
+        """
+        settings = self.settings
+        state = key_fallback.state()
+        if not settings.key_fallback:
+            if state == "on" and key_fallback.set_enabled(False):
+                _logger.info("API-key fallback OFF: feature disabled")
+                self._emit(KeyFallbackEvent(on=False, detail="autoswitch.keyFallback is off"))
+            return
+        if state in ("foreign", "unreadable"):
+            return
+        current = self.switcher.current_account_number()
+        if current is None or self.switcher.account_kind_for(current) == "api_key":
+            return
+        entries = self.switcher.usage_entries_by_account(fetch=set())
+        usage = {num: entry.decision_value() for num, entry in entries.items()}
+        headroom = _headroom_by_account(usage, self._models)
+        active = headroom.get(current)
+        if active is None:
+            return
+        utilization = 100.0 - active
+        if state == "on":
+            if utilization < settings.threshold and key_fallback.set_enabled(False):
+                detail = f"account {current} at {pct_label(utilization)}%"
+                _logger.info("API-key fallback OFF: %s", detail)
+                self._emit(KeyFallbackEvent(on=False, detail=detail))
+            return
+        if utilization < settings.key_fallback_threshold:
+            return
+        quarantined = set(self._read_state().get("quarantine") or {})
+        switchable = [
+            n for n in self.switcher.switchable_account_numbers() if n not in quarantined
+        ]
+        if not any(self.switcher.account_kind_for(n) == "api_key" for n in switchable):
+            return
+        for num in switchable:
+            if num == current or self.switcher.account_kind_for(num) == "api_key":
+                continue
+            h = headroom.get(num)
+            if h is None or (100.0 - h) < settings.threshold:
+                return  # somewhere to switch (or unknown): not spent yet
+        if key_fallback.set_enabled(True):
+            detail = (
+                f"account {current} at {pct_label(utilization)}% and every other "
+                f"subscription at or above {pct_label(settings.threshold)}%"
+            )
+            _logger.info("API-key fallback ON: %s", detail)
+            self._emit(KeyFallbackEvent(on=True, detail=detail))
 
     def _tick_inner(self) -> TickOutcome:
         self._sleep_until_ts = None

@@ -960,6 +960,44 @@ def _menubar_service(args) -> int:
     return 0
 
 
+def _key_helper_command() -> None:
+    """Print the lowest-numbered API-key account's key (Claude Code
+    ``apiKeyHelper``). Nothing else may reach stdout: Claude Code sends the
+    whole output as the key."""
+    try:
+        switcher = ClaudeAccountSwitcher()
+        for num in sorted(switcher.switchable_account_numbers(), key=int):
+            if switcher.account_kind_for(num) != "api_key":
+                continue
+            key = switcher._read_account_credentials(num, switcher.account_email(num))
+            if key:
+                sys.stdout.write(key.strip())
+                sys.exit(0)
+    except SystemExit:
+        raise
+    except Exception as e:
+        print(f"cswap key-helper: {e}", file=sys.stderr)
+        sys.exit(1)
+    print("cswap key-helper: no API-key account is registered", file=sys.stderr)
+    sys.exit(1)
+
+
+def _key_fallback_command(argv: list[str]) -> None:
+    """``cswap key-fallback [status|on|off]``: inspect or force the helper."""
+    from claude_swap import key_fallback
+
+    action = argv[0] if argv else "status"
+    path = key_fallback.claude_settings_path()
+    if action == "on":
+        key_fallback.set_enabled(True, path)
+    elif action == "off":
+        key_fallback.set_enabled(False, path)
+    elif action != "status":
+        print("usage: cswap key-fallback [status|on|off]", file=sys.stderr)
+        sys.exit(2)
+    print(f"API-key fallback: {key_fallback.state(path)} ({path})")
+
+
 def main() -> None:
     """Main entry point for the CLI."""
     force_utf8_output()
@@ -994,6 +1032,12 @@ def main() -> None:
         return
     if argv and argv[0] == "unclaimed":
         _unclaimed_command(argv[1:])
+        return
+    if argv and argv[0] == "key-helper":
+        _key_helper_command()
+        return
+    if argv and argv[0] == "key-fallback":
+        _key_fallback_command(argv[1:])
         return
     if argv and argv[0] == "alias":
         _alias_command(argv[1:])
