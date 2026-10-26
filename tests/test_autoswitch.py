@@ -1933,6 +1933,62 @@ class TestKeyFallback:
         h.tick_with_usage(self._usage(h, None, _usage(100)))
         assert "apiKeyHelper" in self._settings()
 
+    # A hold file (written by the session sentinel when running sessions are stuck on a spent plan: they
+    # keep the plan whose token they hold for hours, so only the key reaches them) keeps the fallback on.
+
+    def _hold(self, data):
+        from claude_swap import key_fallback
+        path = key_fallback.hold_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(data if isinstance(data, str) else json.dumps(data))
+        return path
+
+    def test_a_hold_keeps_the_fallback_on_while_the_live_plan_has_room(self, temp_home):
+        h = self._harness(temp_home)
+        self._hold({"until": h.clock() + 3600, "why": "sessions stuck on plan 3"})
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" in self._settings()
+        assert h.active_number() == 1  # the live login stays on a plan
+        h.clock.advance(1800)
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" in self._settings()
+
+    def test_an_expired_hold_hands_back_to_the_normal_rule(self, temp_home):
+        h = self._harness(temp_home)
+        self._hold({"until": h.clock() + 600})
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" in self._settings()
+        h.clock.advance(601)
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" not in self._settings()
+        assert [e.on for e in self._fallback_events(h)] == [True, False]
+
+    def test_a_hand_written_hold_lasts_until_removed(self, temp_home):
+        h = self._harness(temp_home)
+        path = self._hold("held by hand\n")
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" in self._settings()
+        path.unlink()
+        h.clock.advance(120)
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_the_cap_stop_beats_a_hold(self, temp_home):
+        h = self._harness(temp_home)
+        self._hold({"until": h.clock() + 3600})
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" in self._settings()
+        h.engine.settings = replace(h.engine.settings, key_fallback=False)
+        h.clock.advance(120)
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" not in self._settings()
+
+    def test_a_hold_without_an_api_key_account_does_nothing(self, temp_home):
+        h = self._harness(temp_home, with_key=False)
+        self._hold({"until": h.clock() + 3600})
+        h.tick_with_usage(self._usage(h, _usage(20), _usage(30)))
+        assert "apiKeyHelper" not in self._settings()
+
     def test_never_touches_a_foreign_helper(self, temp_home):
         h = self._harness(temp_home)
         self._write({"apiKeyHelper": "/usr/local/bin/other-helper"})

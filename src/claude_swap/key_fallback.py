@@ -27,9 +27,13 @@ import json
 import os
 import shutil
 import sys
+import time
 from pathlib import Path
 
+from claude_swap.paths import get_backup_root
+
 HELPER_SUBCOMMAND = "key-helper"
+HOLD_FILENAME = "key-fallback.hold"
 
 
 def claude_settings_path() -> Path:
@@ -47,6 +51,36 @@ def helper_command() -> str:
     """Absolute ``cswap key-helper`` command line for ``apiKeyHelper``."""
     exe = shutil.which("cswap") or os.path.abspath(sys.argv[0])
     return f"{exe} {HELPER_SUBCOMMAND}"
+
+
+def hold_path() -> Path:
+    """The hold file: ``<backup root>/key-fallback.hold``."""
+    return get_backup_root() / HOLD_FILENAME
+
+
+def held(now: float | None = None, path: Path | None = None) -> bool:
+    """True while a hold file keeps the fallback on.
+
+    A running session keeps the plan whose token it holds for hours: on
+    2026-10-26 sessions still hit plan 3's limit 24 minutes after the live
+    login moved to plan 4. Moving the live login cannot reach them; only the
+    key can. The session sentinel writes this file when sessions are stuck on
+    a spent plan, so the engine does not take the key away the moment the live
+    plan has room. JSON ``{"until": <epoch>}`` holds until then; anything else
+    (a note written by hand) holds until the file is removed.
+    """
+    p = path or hold_path()
+    try:
+        text = p.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return True
+    if isinstance(data, dict) and isinstance(data.get("until"), (int, float)):
+        return (time.time() if now is None else now) < data["until"]
+    return True
 
 
 def is_ours(value: object) -> bool:

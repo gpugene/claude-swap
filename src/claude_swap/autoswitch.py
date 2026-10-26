@@ -937,6 +937,19 @@ class AutoSwitchEngine:
         current = self.switcher.current_account_number()
         if current is None or self.switcher.account_kind_for(current) == "api_key":
             return
+        if key_fallback.held(now=self.clock()):
+            # Held on (key_fallback.held): never off here, and on if it is not.
+            quarantined = set(self._read_state().get("quarantine") or {})
+            has_key = any(
+                self.switcher.account_kind_for(n) == "api_key"
+                for n in self.switcher.switchable_account_numbers()
+                if n not in quarantined
+            )
+            if state == "off" and has_key and key_fallback.set_enabled(True):
+                detail = f"held by {key_fallback.hold_path()}"
+                _logger.info("API-key fallback ON: %s", detail)
+                self._emit(KeyFallbackEvent(on=True, detail=detail))
+            return
         entries = self.switcher.usage_entries_by_account(fetch=set())
         usage = {num: entry.decision_value() for num, entry in entries.items()}
         headroom = _headroom_by_account(usage, self._models)
